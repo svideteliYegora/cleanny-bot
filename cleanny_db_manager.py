@@ -148,6 +148,8 @@ class DBManager:
         query = f"SELECT * FROM {table} WHERE {conditions}"
 
         records = self.con.execute(query, tuple(params.values())).fetchall()
+        if records:
+            records = [dict(i) for i in records]
 
         return records
 
@@ -213,7 +215,9 @@ class DBManager:
         try:
             with self.con:
                 self.cur.execute(sql_query, tuple(kwargs.values()))
-                return {'id': self.cur.lastrowid, **kwargs}
+                rec_id = self.cur.lastrowid
+                self.cur.execute(f'SELECT * FROM {table} WHERE id = ?', (rec_id, ))
+                return dict(self.cur.fetchone())
         except Exception as e:
             print(f"Ошибка при добавлении записи в таблицу {table}: {e}")
             return {}

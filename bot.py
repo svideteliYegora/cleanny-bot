@@ -20,6 +20,8 @@ from aiogram.utils.keyboard import (
     InlineKeyboardBuilder,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup
 )
 
 from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
@@ -119,7 +121,8 @@ async def auto_assign_orders(**kwargs) -> None:
     Функция для автоматического распределения заказа, в случае, если персонал не принимает заказ в течение часа.
 
     :param kwargs: Словарь с парами ключ - значение: 'staff': список сотрудников,
-    'order_number': номер заказа, 'msg_id': message_id,
+    'id': номер заказа,
+    'msg_id': message_id,
     'chat_id': идентификатор сотрудника которому было отправлено сообщение,
     'user_id': идентификатор пользователя Telegram
     :return: None
@@ -127,7 +130,7 @@ async def auto_assign_orders(**kwargs) -> None:
 
     msg_id = int(kwargs['msg_id'])
     staff_list = kwargs['staff']
-    order_number = kwargs['order_number']
+    order_number = kwargs['id']
     chat_id = kwargs['chat_id']
     user_id = kwargs['user_id']
 
@@ -138,9 +141,17 @@ async def auto_assign_orders(**kwargs) -> None:
     )
 
     # Распределяем заказ
+
     # Получаем сотрудника из списка сотрудников
     employee = random.choice(staff_list)
     fio = employee['ФИО']
+
+    # Ставим часы сотруднику в гугл таблице
+    wsh = sh.get_worksheet(0)
+    row = wsh.find(fio).row
+    col = datetime.fromtimestamp(users_data[user_id]['order']['appointment_datetime']).day + 1
+    wsh.update_cell(row, col, users_data[user_id]['order']['total_time'] + 1)
+
     fio = fio.split(' ')
 
     # Получаем запись о сотруднике из БД
@@ -149,31 +160,33 @@ async def auto_assign_orders(**kwargs) -> None:
     fio = " ".join(fio)
     users_data[user_id]['order_info'].update(employee_fio=fio)
 
-    # Обновляем заказ в БД добавляя сотрудника
-    order = db_manager.update_record('Orders', order_number, staff_id=employee_rec['id'])
+    # Обновляем заказ в БД добавляя сотрудника и меняя статус
+    order = db_manager.update_record('Orders', order_number, staff_id=employee_rec['id'], status='Принят')
     users_data[user_id]['order'] = order
 
     # Добавляем staff_id в заказ
     users_data[kwargs['user_id']]['order']['staff_id'] = employee_rec['tg_id']
-    await bot.send_message(
-        chat_id=employee_rec['tg_id'],
-        text=text.ORDER_MSG.format()
-    )
+
+    users_data[user_id]['order_info'].update(users_data[user_id]['order'])
+
+    order_info = users_data[user_id]['order_info']
+    order_info['appointment_datetime'] = datetime.fromtimestamp(order_info['appointment_datetime']).strftime("%d.%m.%Y %H:%M")
+    order_info['order_date'] = datetime.fromtimestamp(order_info['order_date']).strftime("%d.%m.%Y")
 
     # Отправляем оповещение о заказе сотруднику, админам и пользователю
     await bot.send_message(
         chat_id=employee_rec['tg_id'],
-        text=text.ORDER_MSG.format(**users_data[user_id]['order_info'])
+        text=text.ORDER_MSG.format(**order_info)
     )
 
     await bot.send_message(
         chat_id=admin_chat_id,
-        text=text.ORDER_MSG.format(**users_data[user_id]['order_info'])
+        text=text.ORDER_MSG.format(**order_info)
     )
 
     await bot.send_message(
         chat_id=user_id,
-        text=text.ORDER_MSG.format(**users_data[user_id]['order_info'])
+        text=text.ORDER_MSG.format(**order_info)
     )
 
 
@@ -241,6 +254,14 @@ def create_ikb(buttons: dict, callback_prefix=None) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def dict_clear(user_id: int) -> None:
+    if users_data.get(user_id):
+        user_dt = users_data[user_id].get('user')
+        users_data[user_id].clear()
+        if user_dt:
+            users_data[user_id]['user'] = user_dt
+
+
 # Cоздание списка с именами услуг
 additional_services = [i for i in services_dt if i['additional_service']]
 additional_services_buttons = ['➖' + tuple(i)[1] for i in additional_services]
@@ -273,39 +294,57 @@ payment_ikb = create_ikb(
 # Клавиатура для подтверждения заказа
 order_checkout_ikb = create_ikb({'order-checkout': 'Оформить заказ'})
 
+# Клавиатура для админов
+admin_kb = ReplyKeyboardMarkup(
+    resize_keyboard=True,
+    keyboard=[
+        [KeyboardButton(text='Назначить персонал'), KeyboardButton(text='Заказы')]
+    ]
+)
 
-# @dp.message(F.text)
-# async def msg_handler(msg: Message) -> None:
-#     await msg.answer(text=str(msg.from_user.id))
+
+admin_orders_ikb = create_ikb(
+    {
+        'Активные заказы': 'active'
+    }
+)
 
 
 @dp.message(CommandStart())
 async def cmd_start_handler(msg: Message) -> None:
     user_id = msg.from_user.id
-
-    # Проверка наличия пользователя в таблице Staff
+    dict_clear(user_id)
+    kb = None
     staff_data = db_manager.get_staff_data(user_id)
-    if staff_data:
-        # Является ли пользователь админом
-        if staff_data['is_admin']:
-            await msg.answer(text='Пользователь является админом')
-        else:
-            await msg.answer(text='Пользователь является обслуживающим персоналом')
-    else:
-        await msg.answer(text=text.WELCOME_USER_MSG.format(
-            facebook=html.link('FaceBook', 'https://www.facebook.com/cleanny.happy.home/'),
-            facebook_messenger=html.link('FaceBook Messanger', 'https://www.messenger.com/login.php?next=https%3A%2F%2Fwww.messenger.com%2Ft%2F1189232851104772%2F%3Fmessaging_source%3Dsource%253Apages%253Amessage_shortlink%26source_id%3D1441792%26recurring_notification%3D0'),
-            instagram=html.link('Instagram', 'https://www.instagram.com/bogini_uborka/'),
-            telegram=html.link('Telegram', 'https://telegram.me/cleanny_by')
-        ), disable_web_page_preview=True)
+    if staff_data['is_admin']:
+        users_data[user_id]['user']['is_admin'] = True
+        kb = admin_kb
+    await msg.answer(text=text.WELCOME_USER_MSG.format(
+        facebook=html.link('FaceBook', 'https://www.facebook.com/cleanny.happy.home/'),
+        facebook_messenger=html.link('FaceBook Messanger', 'https://www.messenger.com/login.php?next=https%3A%2F%2Fwww.messenger.com%2Ft%2F1189232851104772%2F%3Fmessaging_source%3Dsource%253Apages%253Amessage_shortlink%26source_id%3D1441792%26recurring_notification%3D0'),
+        instagram=html.link('Instagram', 'https://www.instagram.com/bogini_uborka/'),
+        telegram=html.link('Telegram', 'https://telegram.me/cleanny_by')
+    ), disable_web_page_preview=True, reply_markup=kb)
 
 
 @dp.message(Command('calculate'))
 async def cmd_calculate_handler(msg: Message) -> None:
     user_id = msg.from_user.id
+    dict_clear(user_id)
 
     # Базовое количество комнат и санузлов
     order_detail = {'room': 1, 'bathroom': 1}
+
+    users_data[user_id]['orders_services'] = {
+        '+1 Комната': {
+            'service_id': services_dict['+1 Комната']['id'],
+            'quantity_services': 0
+        },
+        '+1 Санузел': {
+            'service_id': services_dict['+1 Санузел']['id'],
+            'quantity_services': 0
+        }
+    }
 
     # Словарь для хранения доп информации о заказе (количество ванных, количество комнат и тд)
     if users_data.get(user_id):
@@ -329,6 +368,169 @@ async def cmd_calculate_handler(msg: Message) -> None:
     )
 
 
+@dp.message(Command('orders'))
+async def cmd_orders_handler(msg: Message) -> None:
+    user_id = msg.from_user.id
+    dict_clear(user_id)
+
+    if users_data.get(user_id, {}).get('user'):
+        # Получение списка заказов пользователя
+        orders_list = db_manager.cur.execute(
+            """
+                SELECT Orders.*, Staff.first_name, Staff.last_name, Staff.Surname
+                FROM Orders
+                JOIN Staff ON Orders.staff_id = Staff.id
+                WHERE Orders.user_id = ? AND Orders.status IN (?, ?)
+            """, (users_data[user_id]['user']['id'], 'Принят', 'Завершен')).fetchall()
+        if orders_list:
+            orders_list = [dict(i) for i in orders_list]
+
+            # Частота заказов пользователя за последние 30 дней
+            orders_frequency = db_manager.get_order_frequency(user_id)
+
+            # Получение записи со скидкой в соответствие с полученной частотой заказов, если она существует
+            discounts_list = db_manager.cur.execute(
+                'SELECT * FROM Discounts WHERE orders_frequency <= ?',
+                (orders_frequency,)
+            ).fetchall()
+            discount = None
+            if discounts_list:
+                discounts_list = [dict(i) for i in discounts_list]
+                # Выбираем наибольшую скидку
+                discount = discounts_list[0]
+                if len(discounts_list) > 1:
+                    for i in discounts_list[1:]:
+                        if i['discount_value'] > discount['discount_value']:
+                            discount = i
+
+            for i in orders_list:
+                dt = i
+                dt['order_date'] = int(dt['order_date'])
+                dt['order_date'] = datetime.fromtimestamp(dt['order_date']).strftime('%d.%m.%Y')
+                dt['appointment_datetime'] = datetime.fromtimestamp(dt['appointment_datetime']).strftime('%d.%m.%Y %H:%M')
+                dt['employee_fio'] = f'{dt["first_name"]} {dt["last_name"]} {dt["surname"]}'
+                await msg.answer(text=text.ORDER_HISTORY_MSG.format(**dt))
+
+            discount = discount['discount_value'] if discount else 0
+            await msg.answer(text=text.DISCOUNT_MSG.format(discount=discount))
+        else:
+            await msg.answer(text.EMPTY_ORDER_HISTORY)
+    else:
+        await msg.answer(text.EMPTY_ORDER_HISTORY)
+
+
+@dp.message(F.text.in_({'Назначить персонал', 'Заказы'}))
+async def select_staff_handler(msg: Message) -> None:
+    user_id = msg.from_user.id
+    dict_clear(user_id)
+    if users_data[user_id].get('user', {}).get('is_admin') or db_manager.get_staff_data(user_id)['is_admin']:
+        if msg.text == 'Назначить персонал':
+            users_data[user_id]['add_staff'] = True
+            await msg.answer(text=text.ADD_STAFF)
+        else:
+            ikb = create_ikb(
+                {
+                 'admin-order-active': 'Активные заказы',
+                 'admin-order-history': 'История заказов',
+                 'admin-order-close': 'Завершить заказ',
+                 }
+            )
+            await msg.answer(
+                text=text.ACTION_MSG,
+                reply_markup=ikb
+            )
+
+
+@dp.message(F.text)
+async def input_user_data(msg: Message) -> None:
+    user_id = msg.from_user.id
+    u_dt = users_data[user_id]
+    flag = False
+
+    if users_data.get(user_id, {}).get('reg'):
+        number = users_data[user_id]['reg']['flag']
+        users_data[user_id]['reg'][number].append(msg.text)
+        if number == 5:
+            new_user = {i[0]: i[2] for i in users_data[user_id]['reg'].values() if isinstance(i, list)}
+            new_user['tg_id'] = user_id
+            rec = db_manager.insert_record('Users', **new_user)
+            if rec:
+                users_data[user_id]['user'] = rec
+                msg_txt = text.CONFIRM_USER_DATA_MSG.format(**users_data[user_id]['user'])
+                keyboard = udata_confirm_ikb
+                del users_data[user_id]['reg']
+                await msg.answer(
+                    text=msg_txt,
+                    reply_markup=keyboard
+                )
+                return
+            else:
+                await msg.answer(text.ERROR_MSG)
+        users_data[user_id]['reg']['flag'] += 1
+        number = users_data[user_id]['reg']['flag']
+        await msg.answer(
+            text=users_data[user_id]['reg'][number][1]
+        )
+
+    elif users_data.get(user_id, {}).get('add_staff'):
+        tg_id = msg.from_user.id
+        user_id = msg.chat.id
+
+        del users_data[user_id]['add_staff']
+
+        users_data[user_id]['add_staff_data'] = {'tg_id': tg_id}
+        await msg.answer(text.INPUT_STAFF_FIO)
+
+    elif users_data.get(user_id, {}).get('add_staff_data'):
+        # Получаем ФИО
+        last_name, first_name, surname = msg.text.split(' ')
+        fio = {
+            'last_name': last_name,
+            'first_name': first_name,
+            'surname': surname
+        }
+        users_data[user_id]['add_staff_data'].update(fio)
+        # Спрашиваем нужно ли сделать админом
+        ikb = create_ikb({'admin_yes': 'Да', 'admin_no': 'Нет'})
+        await msg.answer(text=text.MAKE_ADMIN_MSG,
+                         reply_markup=ikb)
+    else:
+        param = {}
+        if u_dt.get('input_name'):
+            param['input_name'] = {'first_name': msg.text}
+            flag = True
+        elif u_dt.get('input_last_name'):
+            param['input_last_name'] = {'last_name': msg.text}
+            flag = True
+        elif u_dt.get('input_surname'):
+            param['input_surname'] = {'surname': msg.text}
+            flag = True
+        elif u_dt.get('input_address'):
+            param['input_address'] = {'address': msg.text}
+            flag = True
+        elif u_dt.get('input_phone'):
+            param['input_phone'] = {'phone': msg.text}
+            flag = True
+        elif u_dt.get('input_email'):
+            param['input_email'] = {'email': msg.text}
+            flag = True
+
+    if flag == True:
+        key = tuple(param.keys())[0]
+        del users_data[user_id][key]
+        rec = db_manager.update_record('Users', users_data[user_id]['user']['id'], **param[key])
+        if rec:
+            users_data[user_id]['user'].update(rec)
+            msg_txt = text.CONFIRM_USER_DATA_MSG.format(**users_data[user_id]['user'])
+            keyboard = udata_confirm_ikb
+            await msg.answer(
+                text=msg_txt,
+                reply_markup=keyboard
+            )
+        else:
+            await msg.answer(text=text.ERROR_MSG)
+
+
 @dp.callback_query(F.data.startswith('minus-room') | F.data.startswith('plus-room') | F.data.startswith('minus-bathroom') | F.data.startswith('plus-bathroom'))
 async def room_and_bathroom_change_handler(cb_query: CallbackQuery) -> None:
     cb_data = cb_query.data.split('_')
@@ -348,6 +550,7 @@ async def room_and_bathroom_change_handler(cb_query: CallbackQuery) -> None:
     change, price_change, characteristic = actions[action]
     ind = 1 if characteristic == 'room' else 2
     tm = services_dict['+1 Комната']['lead_time'] if ind < 2 else services_dict['+1 Санузел']['lead_time']
+    service = '+1 Комната' if characteristic == 'room' else '+1 Санузел'
     tm = float(tm)
 
     # Стоимость и время уборки
@@ -359,6 +562,7 @@ async def room_and_bathroom_change_handler(cb_query: CallbackQuery) -> None:
             cb_data[ind] = int(cb_data[ind]) + change
             total_price -= price_change
             total_time -= tm
+            users_data[user_id]['orders_services'][service]['quantity_services'] -= 1
         else:
             return
 
@@ -366,6 +570,7 @@ async def room_and_bathroom_change_handler(cb_query: CallbackQuery) -> None:
         cb_data[ind] = int(cb_data[ind]) + change
         total_price += price_change
         total_time += tm
+        users_data[user_id]['orders_services'][service]['quantity_services'] += 1
 
     users_data[user_id]['order_detail'][characteristic] += change
 
@@ -505,6 +710,58 @@ async def confirm_handler(cb_query: CallbackQuery) -> None:
             reply_markup=payment_ikb
         )
 
+    # Подтверждение заказа персоналом
+    elif cb_query.data.startswith('confirm-order-staff'):
+        user_tg_id = int(cb_query.data.split('_')[1])
+        order_number = int(cb_query.data.split('_')[2])
+        employee_tg_id = user_id
+
+        # Получаем запись о сотруднике из БД
+        employee_rec = db_manager.get_record('Staff', tg_id=employee_tg_id)
+
+        fio = f"{employee_rec['last_name']} {employee_rec['first_name']} {employee_rec['surname']}"
+        users_data[user_tg_id]['order_info'].update(employee_fio=fio)
+
+        # Добавляем сотрудника к заказу
+        rec = db_manager.update_record('Orders', order_number, staff_id=employee_rec['id'], status='Принят')
+        if rec:
+            users_data[user_tg_id]['order'].update(rec)
+            users_data[user_tg_id]['order_info'].update(rec)
+
+            order_info = users_data[user_tg_id]['order_info']
+
+            order_info['appointment_datetime'] = datetime.fromtimestamp(order_info['appointment_datetime']).strftime("%d.%m.%Y %H:%M")
+            order_info['order_date'] = datetime.fromtimestamp(int(order_info['order_date'])).strftime("%d.%m.%Y")
+
+
+            # Ставим часы сотруднику в гугл таблице
+            wsh = sh.get_worksheet(0)
+            row = wsh.find(fio).row
+            col = datetime.fromtimestamp(users_data[user_tg_id]['order']['appointment_datetime']).day + 1
+            wsh.update_cell(row, col, users_data[user_tg_id]['order']['total_time'] + 1)
+
+            # Отправляем оповещение о заказе сотруднику, админам и пользователю
+            await bot.edit_message_text(
+                chat_id=employee_rec['tg_id'],
+                text=text.ORDER_MSG.format(**order_info),
+                message_id=cb_query.message.message_id
+            )
+
+            await bot.send_message(
+                chat_id=admin_chat_id,
+                text=text.ORDER_MSG.format(**order_info)
+            )
+
+            await bot.send_message(
+                chat_id=user_tg_id,
+                text=text.ORDER_MSG.format(**order_info)
+            )
+
+            # Удаляем задачу
+            scheduler.remove_job(users_data[user_tg_id]['job_id'])
+        else:
+            await cb_query.answer(text=text.ERROR_MSG)
+
 
 @dp.callback_query(F.data.startswith('additional-service'))
 async def services_checkboxes_handler(cb_query: CallbackQuery) -> None:
@@ -525,9 +782,18 @@ async def services_checkboxes_handler(cb_query: CallbackQuery) -> None:
             msg = text.CONFIRM_USER_DATA_MSG.format(**users_data[user_id]['user'])
             keyboard = udata_confirm_ikb
         else:
-            msg = text.INPUT_ADDRESS_MSG
-            # Установка флага на ввод адреса
-            users_data[user_id]['input_user_data'] = True
+            msg = text.INPUT_NAME_MSG
+
+            # Установка флага на ввод имени
+            users_data[user_id]['reg'] = {
+                0 : ['first_name', text.INPUT_NAME_MSG],
+                1 : ['last_name', text.INPUT_LASTNAME_MSG],
+                2 : ['surname', text.INPUT_SURNAME_MSG],
+                3 : ['address', text.INPUT_ADDRESS_MSG],
+                4 : ['phone', text.INPUT_PHONE_NUMBER_MSG],
+                5 : ['email', text.INPUT_EMAIL_MSG],
+                'flag': 0
+            }
             keyboard = None
 
         await cb_query.message.edit_text(
@@ -579,8 +845,12 @@ async def payment_choice_handler(cb_query: CallbackQuery) -> None:
     orders_frequency = db_manager.get_order_frequency(user_id)
 
     # Получение записи со скидкой в соответствие с полученной частотой заказов, если она существует
-    discounts_list = db_manager.get_records('Discounts', orders_frequency=orders_frequency, active=True)
+    discounts_list = db_manager.cur.execute(
+        'SELECT * FROM Discounts WHERE orders_frequency <= ?',
+        (orders_frequency, )
+    ).fetchall()
     if discounts_list:
+        discounts_list = [dict(i) for i in discounts_list]
         # Выбираем наибольшую скидку
         discount = discounts_list[0]
         if len(discounts_list) > 1:
@@ -640,13 +910,32 @@ async def order_checkout_handler(cb_query: CallbackQuery) -> None:
 
     # Добавляем заказ в БД `Orders`
     rec = db_manager.insert_record('Orders', **users_data[user_id]['order'])
+
     if rec:
         # Перезаписываем имеющийся словарь
-        users_data[user_id]['order'] = rec
+        users_data[user_id]['order'] = dict(rec)
 
-        # Добавляем в order_info номер заказа
-        users_data[user_id]['order_info']['order_number'] = users_data[user_id]['order']['id']
+        # Добавляем выбранные услуги в `OrdersServices`
+        users_data[user_id]['services'].extend([services_dict['1 Комната']['id'], services_dict['1 Санузел']['id']])
+        for i in users_data[user_id]['services']:
+            db_manager.insert_record(
+                'OrdersServices',
+                order_id=users_data[user_id]['order']['id'],
+                service_id=i,
+                quantity_services=1
+            )
 
+        for key, value in users_data[user_id]['orders_services'].items():
+            if value['quantity_services'] > 0:
+                db_manager.insert_record(
+                    'OrdersServices',
+                    order_id=users_data[user_id]['order']['id'],
+                    service_id=value['service_id'],
+                    quantity_services=value['quantity_services']
+                )
+
+        # Обновляем order_info
+        users_data[user_id]['order_info'].update(users_data[user_id]['order'])
         users_data[user_id]['order_info']['employee_fio'] = 'Сотрудник не выбран'
 
         # Сообщение о том что заказ принят и что он в обработке
@@ -661,7 +950,7 @@ async def order_checkout_handler(cb_query: CallbackQuery) -> None:
 
     # День заказа
     appointment_datetime = users_data[user_id]['order']['appointment_datetime']
-    order_datetime = datetime.utcfromtimestamp(appointment_datetime)
+    order_datetime = datetime.fromtimestamp(appointment_datetime)
     day = str(order_datetime.day)
 
     # Время выполнения заказа + 1 час дороги
@@ -710,11 +999,12 @@ async def order_checkout_handler(cb_query: CallbackQuery) -> None:
                 employee_rec = db_manager.get_record('Staff', last_name=fio[0], first_name=fio[1], surname=fio[2])
 
                 # Отправляем заказ сотруднику
-                employee_tg_id = employee_rec['tg_id']
                 order_number = users_data[user_id]['order']['id']
+
                 ikb = create_ikb(
-                    {f'confirm-order-staff_{employee_tg_id}_{order_number}': 'Принять заказ'}
+                    {f'confirm-order-staff_{user_id}_{order_number}': 'Принять заказ'}
                 )
+
                 msg = await bot.send_message(
                     chat_id=employee_rec['tg_id'],
                     text=text.ORDER_PROPOSAL_MSG.format(**users_data[user_id]['order_info']),
@@ -722,16 +1012,17 @@ async def order_checkout_handler(cb_query: CallbackQuery) -> None:
                 )
 
                 # Закидываем задачу в планировщик и ждем час, если нет ответа от сотрудника распределяем автоматически
-                tm = datetime.now() + timedelta(hours=1)
+                tm = datetime.now() + timedelta(minutes=1)
                 params = {
                     'msg_id': msg.message_id,
                     'staff': free_staff + active_staff,
-                    'order_number': order_number,
+                    'id': order_number,
                     'chat_id': employee_rec['tg_id'],
                     'user_id': user_id
 
                 }
-                scheduler.add_job(auto_assign_orders, 'date', next_run_time=tm, kwargs=params)
+                job = scheduler.add_job(auto_assign_orders, 'date', next_run_time=tm, kwargs=params)
+                users_data[user_id]['job_id'] = job.id
 
             else:
                 # Если нет свободных сотрудников отдаем заказ админу
@@ -741,10 +1032,68 @@ async def order_checkout_handler(cb_query: CallbackQuery) -> None:
                 )
 
 
-
 @dp.callback_query(F.data.startswith('edit'))
 async def edit_handler(cb_query: CallbackQuery) -> None:
-    pass
+    user_id = cb_query.from_user.id
+
+    cb_data = cb_query.data.split('-')[1]
+    if cb_data == 'name':
+        # Установка флага на ввод имени
+        users_data[user_id]['input_name'] = True
+        msg = text.INPUT_NAME_MSG
+
+    elif cb_data == 'last_name':
+        # Установка флага на ввод фамилии
+        users_data[user_id]['input_last_name'] = True
+        msg = text.INPUT_LASTNAME_MSG
+
+    elif cb_data == 'surname':
+        # Установка флага на ввод отчества
+        users_data[user_id]['input_surname'] = True
+        msg = text.INPUT_SURNAME_MSG
+
+    elif cb_data == 'address':
+        # Установка флага на ввод фамилии
+        users_data[user_id]['input_address'] = True
+        msg = text.INPUT_ADDRESS_MSG
+
+    elif cb_data == 'phone':
+        # Установка флага на ввод фамилии
+        users_data[user_id]['input_phone'] = True
+        msg = text.INPUT_PHONE_NUMBER_MSG
+
+    elif cb_data == 'email':
+        # Установка флага на ввод email
+        users_data[user_id]['input_email'] = True
+        msg = text.INPUT_EMAIL_MSG
+
+    await cb_query.message.edit_text(msg)
+
+
+@dp.callback_query(F.data.startswith('admin-order'))
+async def admin_order_action_handler(cb_query: CallbackQuery) -> None:
+   pass
+
+
+@dp.callback_query(F.data.startswith('admin'))
+async def add_admin_handler(cb_query: CallbackQuery) -> None:
+    user_id = cb_query.from_user.id
+    сb_data = cb_query.data.split('_')[1]
+
+    if сb_data == 'yes':
+        users_data[user_id]['add_staff_data']['is_admin'] = True
+
+    # Добавляем новую запись в `Staff`
+    print(users_data[user_id]['add_staff_data'])
+    rec = db_manager.insert_record('Staff', **users_data[user_id]['add_staff_data'])
+    if rec:
+        del users_data[user_id]['add_staff_data']['is_admin']
+        rec['is_admin'] = 'Да' if rec['is_admin'] else 'Нет'
+        msg_txt = text.NEW_STAFF_MSG.format(**rec)
+    else:
+        msg_txt = text.ERROR_MSG
+
+    await cb_query.message.edit_text(msg_txt)
 
 
 async def main() -> None:
